@@ -12,19 +12,20 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.TreeMap;
 import java.util.function.Function;
 import java.util.jar.JarEntry;
 import java.util.jar.JarInputStream;
 import java.util.jar.JarOutputStream;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+
+import static me.pablete1234.Jar.Search.BOTH;
+import static me.pablete1234.Jar.Search.SUPER;
 
 public class JarIntersector {
     private static LogUtil log;
@@ -40,17 +41,17 @@ public class JarIntersector {
         String outputJar = args[2];
         JarIntersector.log = new LogUtil(args.length == 4 ? args[3] : null);
 
-        Map<String, ClassNode> classes1 = getClassNodes(inputJar1);
-        Map<String, ClassNode> classes2 = getClassNodes(inputJar2);
+        Jar jar1 = new Jar(getClassNodes(inputJar1));
+        Jar jar2 = new Jar(getClassNodes(inputJar2));
 
-        Map<String, ClassNode> commonClasses = new HashMap<>(classes1.size());
-        classes1.forEach((name, class1) -> {
-            var class2 = classes2.get(name);
+        Map<String, ClassNode> commonClasses = new HashMap<>(jar1.jar().size());
+        jar1.jar().forEach((name, class1) -> {
+            var class2 = jar2.get(name);
             if (class2 == null) {
                 log.modified("Removing class: " + name);
                 return;
             }
-            commonClasses.put(name, getCommonClassNode(class1, classes1, class2, classes2));
+            commonClasses.put(name, getCommonClassNode(class1, jar1, class2, jar2));
         });
         createCommonJar(outputJar, commonClasses);
 
@@ -88,21 +89,70 @@ public class JarIntersector {
     }
 
     // Main point, merging two classes
-    private static ClassNode getCommonClassNode(ClassNode cls1, Map<String, ClassNode> jar1, ClassNode cls2, Map<String, ClassNode> jar2) {
+    private static ClassNode getCommonClassNode(ClassNode cls1, Jar jar1, ClassNode cls2, Jar jar2) {
         log.modified("Inspecting class: " + cls1.name);
-        cls1.interfaces = resolveInterfaces(cls1, jar1, cls2, jar2);
-        cls1.methods = intersect(cls1.methods, findRecursive(cls2, jar2, c -> c.methods), MethodKey::new);
-        cls1.fields = intersect(cls1.fields, findRecursive(cls2, jar2, c -> c.fields), FieldKey::new);
+        var oldSuper = cls1.superName;
+        var oldItfs = cls1.interfaces;
+        boolean parent = resolveSuper(cls1, jar1, jar2.find(cls2, c -> List.of(c.superName), SUPER).collect(Collectors.toSet()));
+        boolean itfs = resolveInterfaces(cls1, jar1, jar2.find(cls2, c -> c.interfaces, BOTH).collect(Collectors.toSet()));
+        if ((itfs || parent) && cls1.signature != null) {
+            String oldSign = cls1.signature;
+            cls1.signature = rewriteSignature(cls1.signature, oldSuper, cls1.superName, oldItfs, cls1.interfaces);
+            if (!oldSign.equals(cls1.signature))
+                log.modified("  replaced signature " + oldSign + " with " + cls1.signature);
+        }
+
+        // Simple merges, keep only what's in both
+        cls1.methods = intersect(cls1.methods, jar2.find(cls2, c -> c.methods, BOTH), MethodKey::new);
+        cls1.fields = intersect(cls1.fields, jar2.find(cls2, c -> c.fields, BOTH), FieldKey::new);
         cls1.innerClasses = intersect(cls1.innerClasses, cls2.innerClasses.stream(), InnerClassKey::new);
 
         return cls1;
     }
 
-    private static <T> Stream<T> findRecursive(ClassNode node, Map<String, ClassNode> jar, Function<ClassNode, Collection<T>> extractor) {
-        if (node == null) return Stream.empty();
-        return Stream.concat(
-                extractor.apply(node).stream(),
-                Stream.concat(Stream.of(node.superName), node.interfaces.stream()).map(jar::get).flatMap(cls -> findRecursive(cls, jar, extractor)));
+    private static String rewriteSignature(String signature,
+                                           String oldSuper, String newSuper,
+                                           List<String> oldItfs, List<String> newItfs) {
+        if (!oldSuper.equals(newSuper)) signature = signature.replaceFirst(regexEscape(oldSuper), newSuper);
+
+        // Interfaces were just stripped, not replaced. Strip them from signature too
+        Set<String> toStrip = new HashSet<>(oldItfs);
+        if (toStrip.containsAll(oldItfs)) {
+            newItfs.forEach(toStrip::remove);
+            // Nothing to rewrite
+            if (toStrip.isEmpty()) return signature;
+
+            // Ends up being something like: L(com\/example\/A|com\/example\/B)(<.*>)?;
+            var escaped = toStrip.stream().map(JarIntersector::regexEscape).collect(Collectors.joining("|"));
+            return signature.replaceAll("L(" + escaped + ")(<.*>)?;","");
+        } else { // Replaced signatures are not worth handling, just void the generic data.
+            return null;
+        }
+    }
+
+    private static String regexEscape(String className) {
+        return className.replace("/", "\\/");
+    }
+
+    private static boolean resolveInterfaces(ClassNode cls1, Jar jar1, Set<String> bItf) {
+        var newItf = cls1.interfaces.stream().flatMap(itf -> jar1.findInterfaces(itf, bItf)).distinct().toList();
+        if (cls1.interfaces.equals(newItf)) return false;
+        log.replacedInterfaces(cls1.interfaces, newItf);
+        cls1.interfaces = newItf;
+        return true;
+    }
+
+    private static boolean resolveSuper(ClassNode cls1, Jar jar1, Set<String> bSupers) {
+        ClassNode current = cls1;
+        while (!bSupers.contains(current.superName)) {
+            ClassNode parent = jar1.get(current.superName);
+            if (parent == null) break; // Parent not found in same jar. Could be extending a library, keep it.
+            current = parent;
+        }
+        if (cls1.superName.equals(current.superName)) return false;
+        log.replacedParent(cls1.superName, current.superName);
+        cls1.superName = current.superName;
+        return true;
     }
 
     private static <T, K> List<T> intersect(List<T> a, Stream<T> b, Function<T, K> key) {
@@ -114,21 +164,6 @@ public class JarIntersector {
         });
         return copy;
     }
-
-    private static List<String> resolveInterfaces(ClassNode cls1, Map<String, ClassNode> jar1, ClassNode cls2, Map<String, ClassNode> jar2) {
-        Set<String> interfacesB = findRecursive(cls2, jar2, c -> c.interfaces).collect(Collectors.toSet());
-        List<String> newItf = cls1.interfaces.stream().flatMap(itf -> getInterfaces(itf, jar1, interfacesB)).toList();
-        log.replaced(cls1.interfaces, newItf);
-        return newItf;
-    }
-
-    private static Stream<String> getInterfaces(String base, Map<String, ClassNode> jar, Set<String> allowed) {
-        if (allowed.contains(base)) return Stream.of(base);
-        ClassNode baseCls = jar.get(base);
-        if (baseCls == null) return Stream.empty();
-        return baseCls.interfaces.stream().flatMap(pItf -> getInterfaces(pItf, jar, allowed));
-    }
-
 
     private static final int ACCESS_MODIFIERS = Modifier.PUBLIC | Modifier.PRIVATE | Modifier.PROTECTED;
 
@@ -161,56 +196,6 @@ public class JarIntersector {
         @Override
         public String toString() {
             return "InnerClass[" + Modifier.toString(access) + " " + name + "]";
-        }
-    }
-
-    static class LogUtil {
-        private final Level level;
-
-        private LogUtil(String level) {
-            this.level = Level.of(level);
-        }
-
-        public void jar(Map<String, ClassNode> jar) {
-            if (level.ordinal() < Level.FULL.ordinal()) return;
-            System.out.println("Written all classes & methods: ");
-            new TreeMap<>(jar).forEach((str, cls) ->
-                    cls.methods.forEach(m -> System.out.println(str + "#" + m.name + m.desc)));
-        }
-
-        public <T> void replaced(Collection<T> a, Collection<T> b) {
-            if (level.ordinal() < Level.MODIFIED.ordinal()) return;
-
-            if (!Set.copyOf(a).equals(Set.copyOf(b)))
-                log.modified("  replaced " + a + " with " + b);
-        }
-
-        public void modified(String str) {
-            if (level.ordinal() < Level.MODIFIED.ordinal()) return;
-            System.out.println(str);
-        }
-
-        public boolean removing(boolean removing, Object obj) {
-            if (level.ordinal() >= Level.MODIFIED.ordinal())
-                System.out.println("  removing " + obj);
-            return removing;
-        }
-
-        enum Level {
-            NONE,
-            MODIFIED,
-            FULL;
-
-            static Level of(String level) {
-                if (level == null) return MODIFIED;
-                try {
-                    return Level.valueOf(level.toUpperCase());
-                } catch (IllegalArgumentException e) {
-                    System.err.println("Invalid log level '" + level + "', " +
-                            "expected one of " + Arrays.toString(Level.values()) + ", defaulting to " + MODIFIED);
-                }
-                return MODIFIED;
-            }
         }
     }
 
