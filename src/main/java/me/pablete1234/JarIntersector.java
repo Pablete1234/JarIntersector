@@ -17,6 +17,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.jar.JarEntry;
 import java.util.jar.JarInputStream;
@@ -103,9 +104,12 @@ public class JarIntersector {
         }
 
         // Simple merges, keep only what's in both
-        cls1.methods = intersect(cls1.methods, jar2.find(cls2, c -> c.methods, BOTH), MethodKey::new);
-        cls1.fields = intersect(cls1.fields, jar2.find(cls2, c -> c.fields, BOTH), FieldKey::new);
-        cls1.innerClasses = intersect(cls1.innerClasses, cls2.innerClasses.stream(), InnerClassKey::new);
+        cls1.methods = intersect(cls1.methods, jar2.find(cls2, c -> c.methods, BOTH),
+            MethodKey::new, (a, b) -> a.access = mergeModifiers(a.access, b.access));
+        cls1.fields = intersect(cls1.fields, jar2.find(cls2, c -> c.fields, BOTH),
+            FieldKey::new, (a, b) -> a.access = mergeModifiers(a.access, b.access));
+        cls1.innerClasses = intersect(cls1.innerClasses, cls2.innerClasses.stream(),
+            InnerClassKey::new, (a, b) -> a.access = mergeModifiers(a.access, b.access));
 
         return cls1;
     }
@@ -155,48 +159,67 @@ public class JarIntersector {
         return true;
     }
 
-    private static <T, K> List<T> intersect(List<T> a, Stream<T> b, Function<T, K> key) {
-        Set<K> bKeys = b.map(key).collect(Collectors.toSet());
+    private static <T, K> List<T> intersect(List<T> a, Stream<T> b, Function<T, K> key, BiConsumer<T, T> op) {
+        Map<K, T> bKeys = b.collect(Collectors.toMap(key, Function.identity(), (v, ignore) -> v));
         List<T> copy = new ArrayList<>(a);
-        copy.removeIf(el -> {
-            K k = key.apply(el);
-            return log.removing(!bKeys.contains(k), k);
+        copy.removeIf(elA -> {
+            K k = key.apply(elA);
+            T elB = bKeys.get(k);
+            if (elB != null) op.accept(elA, elB);
+            return log.removing(elB == null, k);
         });
         return copy;
     }
 
     private static final int ACCESS_MODIFIERS = Modifier.PUBLIC | Modifier.PRIVATE | Modifier.PROTECTED;
 
-    record MethodKey(String name, String desc, int access) {
+    record MethodKey(String name, String desc) {
         public MethodKey(MethodNode method) {
-            this(method.name, method.desc, method.access & ACCESS_MODIFIERS);
+            this(method.name, method.desc);
         }
 
         @Override
         public String toString() {
-            return "Method[" + Modifier.toString(access) + " " + name + desc + "]";
+            return "Method[" + name + desc + "]";
         }
     }
 
-    record FieldKey(String name, String desc, int access) {
+    record FieldKey(String name, String desc) {
         public FieldKey(FieldNode field) {
-            this(field.name, field.desc, field.access & ACCESS_MODIFIERS);
+            this(field.name, field.desc);
         }
 
         @Override
         public String toString() {
-            return "Field[" + Modifier.toString(access) + " "  + name + desc + "]";
+            return "Field[" + name + desc + "]";
         }
     }
 
-    record InnerClassKey(String name, int access) {
+    record InnerClassKey(String name) {
         public InnerClassKey(InnerClassNode inner) {
-            this(inner.name, inner.access & ACCESS_MODIFIERS);
+            this(inner.name);
         }
         @Override
         public String toString() {
-            return "InnerClass[" + Modifier.toString(access) + " " + name + "]";
+            return "InnerClass[" + name + "]";
         }
+    }
+
+    private static int mergeModifiers(int a, int b) {
+        if (a == b) return a;
+        int accessA = a & ACCESS_MODIFIERS;
+        int accessB = b & ACCESS_MODIFIERS;
+        if (accessA == accessB) return a;
+
+        // Remove the access modifiers, later add just one of them
+        a &= ~ACCESS_MODIFIERS;
+
+        int either = accessA | accessB;
+        // Return the most restrictive in either
+        if ((either & Modifier.PRIVATE) != 0) return a | Modifier.PRIVATE;
+        if ((either & Modifier.PROTECTED) != 0) return a | Modifier.PROTECTED;
+        if ((either & Modifier.PUBLIC) != 0) return a | Modifier.PUBLIC;
+        return a; // Fallback, no access modifier?
     }
 
 }
